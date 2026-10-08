@@ -294,7 +294,12 @@ async function retry(fn, retries = 3) {
       return await fn();
     } catch (e) {
       last = e;
-      if (attempt < retries) await sleep(1000 * Math.pow(2, attempt - 1));
+      if (attempt < retries) {
+        // 429 (rate limit) pe zyada wait karo
+        const is429 = /429|too_many/.test(e.message);
+        const base = is429 ? 4000 : 1000;
+        await sleep(base * Math.pow(2, attempt - 1));
+      }
     }
   }
   throw new Error(`retry exhausted: ${last && last.message}`);
@@ -400,9 +405,12 @@ async function registerGuest(password) {
     },
     body,
   });
-  if (r.status !== 200) throw new Error(`register HTTP ${r.status}`);
+  if (r.status !== 200) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`register HTTP ${r.status}: ${t.slice(0, 200)}`);
+  }
   const d = await r.json();
-  if (d.code !== 0) throw new Error(`register failed: ${d.message}`);
+  if (d.code !== 0) throw new Error(`register failed: ${d.error || d.message} (code ${d.code})`);
   return String(d.data.uid);
 }
 
@@ -426,7 +434,10 @@ async function getToken(uid, password) {
     },
     body,
   });
-  if (r.status !== 200) throw new Error(`token HTTP ${r.status}`);
+  if (r.status !== 200) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`token HTTP ${r.status}: ${t.slice(0, 200)}`);
+  }
   const d = await r.json();
   if (!d.access_token || !d.open_id) throw new Error("token missing fields");
   return { accessToken: d.access_token, openId: d.open_id };
@@ -450,8 +461,8 @@ async function generateNickname(openId) {
     },
     body: encrypted,
   });
-  if (r.status !== 200) throw new Error(`nickname HTTP ${r.status}`);
-  const name = (await r.text()).trim();
+  if (r.status !== 200) throw new Error(`nickname HTTP ${r.status}: ${(await r.text().catch(() => "")).slice(0, 150)}`);
+  const name = (await r.text().catch(() => "")).trim();
   if (!name) throw new Error("empty nickname");
   return name;
 }
@@ -490,7 +501,7 @@ async function sendMajorRegister(nickname, accessToken, openId) {
     },
     body: encrypted,
   });
-  if (r.status !== 200) throw new Error(`majorregister HTTP ${r.status}`);
+  if (r.status !== 200) throw new Error(`majorregister HTTP ${r.status}: ${(await r.text().catch(() => "")).slice(0, 150)}`);
   const parsed = parseProto(new Uint8Array(await r.arrayBuffer()));
   const aid = parsed[3];
   if (!aid) throw new Error("no account_id");
@@ -592,7 +603,7 @@ async function sendMajorLogin(accessToken, openId, platform = "4") {
     },
     body: encrypted,
   });
-  if (r.status !== 200) throw new Error(`majorlogin HTTP ${r.status}`);
+  if (r.status !== 200) throw new Error(`majorlogin HTTP ${r.status}: ${(await r.text().catch(() => "")).slice(0, 150)}`);
 
   const raw = new Uint8Array(await r.arrayBuffer());
   const candidates = [aesDecrypt(raw), raw.length > 64 ? raw.slice(64) : null, raw];
@@ -744,10 +755,10 @@ async function pool(n, limit, fn) {
     while (next < n) {
       const idx = next++;
       try {
-        out[idx] = await fn(idx);
+        out[idx] = { ok: true, account: await fn(idx) };
       } catch (e) {
         console.log(`[${idx + 1}] failed: ${e.message}`);
-        out[idx] = null;
+        out[idx] = { ok: false, error: e.message };
       }
     }
   });
@@ -789,10 +800,41 @@ export default {
           "/gen?count=1": "Naye UID + password generate karo",
           "/gen?count=5": "5 accounts ek saath",
           "/gen?count=1&activate=1": "Generate + activation (GetLoginData)",
+          "/gen?count=1&retries=5": "Retries per step badhao (max 8)",
+          "/debug": "Sirf register step test karo — poora response dikhega",
         },
         limits: { count: "jitna doge utna (default 1)" },
         fields: ["uid", "password", "nickname", "open_id", "access_token", "account_id", "jwt", "session_key", "session_iv"],
       });
+    }
+
+    // ── debug: sirf register step, poora response ──
+    if (url.pathname === "/debug") {
+      const password = await sha256Hex(crypto.getRandomValues(new Uint8Array(32)));
+      const payload = { app_id: APP_ID, client_type: 2, password, source: 2 };
+      const body = JSON.stringify(payload);
+      const sig = await hmacSha256Hex(CLIENT_SECRET, body);
+      try {
+        const r = await fetch(OAUTH_REGISTER_URL, {
+          method: "POST",
+          headers: {
+            "User-Agent": "GarenaMSDK/4.0.42(KB2003 ;Android 13;en;HK;app 2.130.1 2019118332;)",
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": `Signature ${sig}`,
+          },
+          body,
+        });
+        const text = await r.text();
+        return json({
+          status: r.status,
+          statusText: r.statusText,
+          cf_ip_see_headers: Object.fromEntries([...r.headers].filter(([k]) => k.startsWith("cf-") || k === "server")),
+          body: text.slice(0, 1000),
+        });
+      } catch (e) {
+        return json({ fetch_error: e.message, cause: e.cause ? String(e.cause) : null }, 502);
+      }
     }
 
     // ── generator ──
@@ -800,11 +842,15 @@ export default {
       let count = parseInt(url.searchParams.get("count") || "1", 10);
       if (!Number.isFinite(count) || count < 1) count = 1;
       const activate = url.searchParams.get("activate") === "1";
+      let retries = parseInt(url.searchParams.get("retries") || "3", 10);
+      if (!Number.isFinite(retries) || retries < 1) retries = 3;
+      if (retries > 8) retries = 8;
 
       const started = Date.now();
       // concurrency: count ke hisaab se, max 10 parallel
-      const results = await pool(count, Math.min(10, count), () => generateOne(activate));
-      const accounts = results.filter(Boolean);
+      const results = await pool(count, Math.min(10, count), () => generateOne(activate, retries));
+      const accounts = results.filter((r) => r.ok).map((r) => r.account);
+      const errors = results.filter((r) => !r.ok).map((r) => r.error);
 
       return json({
         success: accounts.length > 0,
@@ -813,6 +859,7 @@ export default {
         failed: count - accounts.length,
         activated: activate ? accounts.filter((a) => a.activated).length : undefined,
         took_ms: Date.now() - started,
+        errors: errors.length ? errors.slice(0, 5) : undefined,
         accounts,
       });
     }
